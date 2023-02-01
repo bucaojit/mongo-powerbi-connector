@@ -31,17 +31,66 @@ MongoDBAtlasODBCImpl = (mongodbUri as text,
                         database as text, 
                         optional query as text, 
                         optional options as record) 
-                        as table => 
+                        as any => 
     let
         ConnectionString = GetConnectionString(mongodbUri, database),
         CredentialConnectionString = GetCredentialConnectionString(),
         Config = BuildOdbcConfig(),
-        Result =    if query <> null then
+        DataSource =    if query <> null then
                         Odbc.Query(ConnectionString, query,  [ CredentialConnectionString = CredentialConnectionString ])
                     else
-                        Odbc.DataSource(ConnectionString, Config & [ CredentialConnectionString = CredentialConnectionString ])
+                        Odbc.DataSource(ConnectionString, Config & [ CredentialConnectionString = CredentialConnectionString ]),
+        
+        Metadata = Value.Metadata(Value.Type(DataSource)),
+        TransformComplexColumns = 
+            let
+                TransformComplexColumns = (table) => 
+                    let
+                        TableType = Value.Type(table),
+                        Schema = Table.Schema(table),                        
+                        ComplexColumns = Table.ToRecords(Table.SelectRows(Schema, 
+                            each [NativeTypeName]  = "timestamp" 
+                            or [NativeTypeName] = "maxKey" 
+                            or [NativeTypeName] = "minKey"
+                            or [NativeTypeName] = "array"
+                            or [NativeTypeName] = "undefined"
+                            or [NativeTypeName] = "null"
+                            or [NativeTypeName] = "dbPointer"
+                            or [NativeTypeName] = "symbol"
+                            or [NativeTypeName] = "objectId"
+                            or [NativeTypeName] = "object"
+                            or [NativeTypeName] = "javascript"
+                            or [NativeTypeName] = "javascriptWIthScope"
+                            or [NativeTypeName] = "decimal"
+                            or [NativeTypeName] = "regex")),
+                        TransformOperations = List.Accumulate(ComplexColumns, table, (state, column) =>
+                            let
+                                ColumnType = Type.TableColumn(TableType, column[Name]),
+                                TransformColumn = Table.TransformColumns(state, { column[Name], Text.FromBinary })
+                            in
+                                TransformColumn)
+                    in
+                        TransformOperations,
+
+                TransformColumnKeepType = (table, columnName, operation) =>
+                    let
+                        TableType = Value.Type(table),
+                        TransformColumn = Table.TransformColumns(table, { columnName, operation, Type.TableColumn(table, columnName) }),
+                        ReplaceType = Value.ReplaceType(TransformColumn, TableType)
+                    in
+                        ReplaceType,
+    
+                TransformColumns =  if query <> null then 
+                                        TransformComplexColumns(DataSource)
+                                    else
+                                        TransformColumnKeepType(DataSource, "Data", 
+                                            (tables) => TransformColumnKeepType(tables, "Data",
+                                                TransformComplexColumns))
+            in
+                TransformColumns,
+        WithMetadata = Value.ReplaceType(TransformComplexColumns, Value.ReplaceMetadata(Value.Type(DataSource), Metadata))
     in
-        Result;
+        WithMetadata;
 
 GetCredentialConnectionString = () as record =>
     let
@@ -93,7 +142,20 @@ MongoDBAtlasODBC.Icons = [
 
 BuildOdbcConfig = () as record =>
     let
+        AstVisitor = [
+            // Specifying the supported LIMIT OFFSET format
+            LimitClause = (skip, take) =>
+                let
+                    offset = if (skip > 0) then Text.Format("OFFSET #{0}", {skip}) else "",
+                    limit = if (take <> null) then Text.Format("LIMIT #{0}", {take}) else ""
+                in
+                    [
+                        Text = Text.Format("#{0} #{1}", {offset, limit}),
+                        Location = "AfterQuerySpecification"
+                    ]
+        ],
         Config = [
+            AstVisitor = AstVisitor,
             HierarchicalNavigation = true,
             SqlCapabilities = [
                 FractionalSecondsScale = 3,
@@ -115,3 +177,26 @@ BuildOdbcConfig = () as record =>
         ]
     in
         Config;
+
+// Fixes navigation table return from ODBC hierarchical navigation
+// to not have Kind as part of the key and to remove columns that return
+// not value for this ODBC driver such as "Description".
+FixNavigationTable = (table) =>
+    let
+        SelectColumns = Table.SelectColumns(table, { "Name", "Data", "Kind" }),
+        OriginalType = Value.Type(SelectColumns),
+        Type = type table [
+            Name = Type.TableColumn(OriginalType, "Name"),
+            Data = Type.TableColumn(OriginalType, "Data"),
+            Kind = Type.TableColumn(OriginalType, "Kind")
+        ],
+        AddKey = Type.AddTableKey(Type, { "Name" }, true),
+        AddMetadata = AddKey meta [
+            NavigationTable.NameColumn = "Name",
+            NavigationTable.DataColumn = "Data",
+            NavigationTable.KindColumn = "Kind",
+            Preview.DelayColumn = "Data"
+        ],
+        ReplaceType = Value.ReplaceType(SelectColumns, AddMetadata)
+    in
+        ReplaceType;
